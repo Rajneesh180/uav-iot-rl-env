@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "openenv-uav-iot-env"
+version = "0.1.0"
+description = "UAV-IoT data collection environment for OpenEnv — autonomous drone navigates obstacles to collect sensor data"
+requires-python = ">=3.10"
+authors = [
+    {name = "Rajneesh Chaudhary"},
+]
+dependencies = [
+    "openenv-core[core]>=0.2.2",
+    "fastapi>=0.115.0",
+    "pydantic>=2.0.0",
+    "uvicorn>=0.24.0",
+    "requests>=2.31.0",
+]
+
+[project.scripts]
+server = "uav_iot_env.server.app:main"
+
+[tool.setuptools]
+include-package-data = true
+packages = ["uav_iot_env", "uav_iot_env.server", "uav_iot_env.server.simulation"]
+package-dir = { "uav_iot_env" = ".", "uav_iot_env.server" = "server", "uav_iot_env.server.simulation" = "server/simulation" }
