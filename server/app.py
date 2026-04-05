@@ -6,11 +6,17 @@ from openenv.core.env_server.http_server import create_app
 try:
     from ..models import UAVAction, UAVObservation
     from .uav_iot_environment import UAVIoTEnvironment
+    from .gradio_ui import build_uav_gradio_app
 except ImportError:
     from models import UAVAction, UAVObservation
     from server.uav_iot_environment import UAVIoTEnvironment
+    from server.gradio_ui import build_uav_gradio_app
 
-app = create_app(UAVIoTEnvironment, UAVAction, UAVObservation, env_name="uav_iot_env")
+app = create_app(
+    UAVIoTEnvironment, UAVAction, UAVObservation,
+    env_name="uav_iot_env",
+    gradio_builder=build_uav_gradio_app,
+)
 
 
 def main():
