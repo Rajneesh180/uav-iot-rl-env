@@ -347,9 +347,9 @@ class UAVIoTEnvironment(Environment[UAVAction, UAVObservation, UAVState]):
         return sum(self._nodes[i]["priority"] for i in self._rps)
 
     def _compute_score(self) -> float:
-        """Compute final score (0.0–1.0) for grading."""
+        """Compute final score in the open interval (0, 1) for grading."""
         if not self._rps:
-            return 0.0
+            return 0.01
 
         coverage = len(self._visited_rps) / len(self._rps)
         dp = self._data_possible()
@@ -357,12 +357,14 @@ class UAVIoTEnvironment(Environment[UAVAction, UAVObservation, UAVState]):
         energy_eff = self._battery_pct()  # higher remaining = more efficient
         safe_return = 1.0 if self._at_base() and self._battery > 0 else 0.0
 
-        return (
+        raw = (
             0.35 * coverage
             + 0.25 * priority_score
             + 0.25 * energy_eff
             + 0.15 * safe_return
         )
+        # Clamp to open interval (0, 1) — hackathon requires strict bounds
+        return max(0.01, min(0.99, raw))
 
     def _at_base(self) -> bool:
         return math.hypot(self._uav_x - self._base[0],
