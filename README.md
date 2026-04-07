@@ -8,6 +8,7 @@ pinned: false
 app_port: 8000
 tags:
   - openenv
+base_path: /web
 ---
 
 # UAV-Assisted IoT Sensor Data Collection Environment
@@ -62,11 +63,11 @@ score = 0.35 × coverage + 0.25 × priority_ratio + 0.25 × energy_efficiency + 
 
 Tested against **Qwen2.5-Coder-32B-Instruct** via HuggingFace Inference API:
 
-| Task | Steps | Score | Notes |
-|------|-------|-------|-------|
-| easy | 18 | 0.655 | All RPs visited, safe return |
-| medium | — | — | (pending re-run) |
-| hard | — | — | (pending re-run) |
+| Task | Steps | Score | Result |
+|------|-------|-------|--------|
+| easy | 13 | 1.12 | All 3 RPs visited, safe return |
+| medium | 3 | 0.14 | Partial (API credits exhausted mid-run) |
+| hard | 1 | 0.20 | Partial (API credits exhausted mid-run) |
 
 Random agent baseline scores ~0.05 on easy (mostly crashes or times out).
 
@@ -94,24 +95,25 @@ docker run -p 8000:8000 uav-iot-env
 ## Project Structure
 
 ```
+├── __init__.py                # Package exports
+├── models.py                  # Action, Observation, State
+├── client.py                  # EnvClient wrapper
 ├── inference.py               # LLM agent with [START]/[STEP]/[END] logs
 ├── openenv.yaml
 ├── pyproject.toml
-├── Dockerfile
+├── uv.lock
 ├── README.md
-└── uav_iot_env/
-    ├── __init__.py
-    ├── models.py              # Action, Observation, State
-    ├── client.py              # EnvClient wrapper
-    └── server/
-        ├── app.py             # create_app() entrypoint
-        ├── uav_iot_environment.py
-        └── simulation/
-            ├── __init__.py    # Task configs, constants
-            ├── deployment.py  # Sensor/obstacle placement
-            ├── energy.py      # Rotary-wing energy model
-            ├── path_planning.py # Visibility-graph Dijkstra
-            └── rp_selection.py  # Dominating-set clustering
+└── server/
+    ├── Dockerfile
+    ├── app.py                 # create_app() entrypoint
+    ├── gradio_ui.py           # Custom Gradio visualization tab
+    ├── uav_iot_environment.py
+    └── simulation/
+        ├── __init__.py        # Task configs, constants
+        ├── deployment.py      # Sensor/obstacle placement
+        ├── energy.py          # Rotary-wing energy model
+        ├── path_planning.py   # Visibility-graph Dijkstra
+        └── rp_selection.py    # Dominating-set clustering
 ```
 
 ## Reward Signals

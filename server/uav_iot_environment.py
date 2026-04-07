@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import uuid
+from difflib import get_close_matches
 from typing import Any, Optional
 
 from openenv.core.env_server.interfaces import Environment
@@ -45,6 +46,45 @@ MOVE_DIRS: dict[str, tuple[float, float]] = {
     "move_W":  (-1, 0),
     "move_NW": (-_SQRT2_2, -_SQRT2_2),
 }
+ALL_ACTIONS = list(MOVE_DIRS) + ["hover_collect", "return_base"]
+
+# Short instructions shown in the playground instead of the full README.
+PLAYGROUND_INSTRUCTIONS = """\
+# UAV IoT Data Collection
+
+Control a UAV to collect data from IoT sensor clusters and return to base.
+
+## How to Play
+
+1. **Reset** the environment (picks task: easy / medium / hard)
+2. **Move** toward sensor clusters using directional actions
+3. **Hover** near a cluster to collect its data
+4. **Return to base** before your battery runs out
+
+## Actions
+
+| Action | What it does |
+|--------|-------------|
+| `move_N` `move_NE` `move_E` ... | Fly ~50 m in that direction (costs 850 J) |
+| `hover_collect` | Hover for 10 s, collects data from RPs within 60 m (costs 1685 J) |
+| `return_base` | Autopilot back to base (path avoids obstacles) |
+
+## Tips
+
+- Check `sensors` in the observation for RP locations and distances
+- Prioritise high-priority RPs (higher `priority` = more score)
+- Watch `battery_pct` — if it hits 0 the UAV crashes (−1.0 reward)
+- Use `return_base` when you've collected enough or battery is low
+- `hover_collect` only works within 60 m of an unvisited RP
+- Obstacles block movement; the UAV cannot fly through them
+
+## Scoring
+
+```
+score = 0.35 × coverage + 0.25 × priority_ratio
+      + 0.25 × energy_efficiency + 0.15 × safe_return
+```
+"""
 
 
 class UAVIoTEnvironment(Environment[UAVAction, UAVObservation, UAVState]):
@@ -83,6 +123,15 @@ class UAVIoTEnvironment(Environment[UAVAction, UAVObservation, UAVState]):
     # ------------------------------------------------------------------
     #  OpenEnv interface
     # ------------------------------------------------------------------
+
+    def get_metadata(self):
+        from openenv.core.env_server.interfaces import EnvironmentMetadata
+        return EnvironmentMetadata(
+            name="UAVIoTEnvironment",
+            description="UAV navigates obstacles, collects IoT sensor data, returns to base.",
+            version="1.0.0",
+            readme_content=PLAYGROUND_INSTRUCTIONS,
+        )
 
     def reset(
         self,
@@ -131,9 +180,7 @@ class UAVIoTEnvironment(Environment[UAVAction, UAVObservation, UAVState]):
 
         return self._make_observation(
             reward=0.0,
-            message=f"Episode started. Task={task_name}. "
-                    f"Collect data from {len(self._rps)} RPs and return to base. "
-                    f"Battery: {self._battery_pct():.0%}.",
+            message=self._build_reset_message(task_name),
         )
 
     def step(
@@ -160,8 +207,7 @@ class UAVIoTEnvironment(Environment[UAVAction, UAVObservation, UAVState]):
         elif act == "return_base":
             reward, msg = self._do_return_base()
         else:
-            msg = f"Unknown action '{act}'. Valid: {', '.join(list(MOVE_DIRS) + ['hover_collect', 'return_base'])}"
-            reward = -0.01
+            reward, msg = self._handle_unknown_action(act)
 
         # Small time penalty to encourage efficiency
         reward -= 0.005
@@ -176,6 +222,7 @@ class UAVIoTEnvironment(Environment[UAVAction, UAVObservation, UAVState]):
             msg += " Max steps reached."
 
         self._total_reward += reward
+        msg += self._build_hint()
         return self._make_observation(reward=reward, message=msg)
 
     @property
@@ -219,7 +266,7 @@ class UAVIoTEnvironment(Environment[UAVAction, UAVObservation, UAVState]):
         self._battery -= energy_for_distance(dist)
         self._uav_x = new_x
         self._uav_y = new_y
-        return 0.0, f"Moved {direction.replace('move_', '')} to ({new_x:.0f},{new_y:.0f})."
+        return 0.0, f"Moved {direction.replace('move_', '')} to ({new_x:.0f},{new_y:.0f}). Battery: {self._battery_pct():.0%}."
 
     def _do_hover_collect(self) -> tuple[float, str]:
         self._battery -= energy_for_hover()
@@ -238,8 +285,22 @@ class UAVIoTEnvironment(Environment[UAVAction, UAVObservation, UAVState]):
             priorities = [self._nodes[i]["priority"] for i in collected_ids]
             reward = sum(p / 10.0 for p in priorities) * 0.3
             names = ", ".join(f"RP-{i}(pri={self._nodes[i]['priority']})" for i in collected_ids)
-            return reward, f"Collected data from {names}."
-        return -0.01, "No uncollected RPs within collection range."
+            remaining = len(self._rps) - len(self._visited_rps)
+            return reward, (
+                f"Collected data from {names}. "
+                f"Progress: {len(self._visited_rps)}/{len(self._rps)} RPs"
+                f"{' — all collected!' if remaining == 0 else f' ({remaining} remaining).'}"
+            )
+
+        # Find nearest unvisited RP to help user
+        nearest = self._nearest_rp()
+        if nearest:
+            rp_idx, dist = nearest
+            return -0.01, (
+                f"No RPs within {COLLECT_RADIUS:.0f} m range. "
+                f"Nearest unvisited: RP-{rp_idx} at {dist:.0f} m."
+            )
+        return -0.01, "No uncollected RPs within range."
 
     def _do_return_base(self) -> tuple[float, str]:
         """Fly back to base using obstacle-aware path."""
@@ -305,6 +366,106 @@ class UAVIoTEnvironment(Environment[UAVAction, UAVObservation, UAVState]):
     def _at_base(self) -> bool:
         return math.hypot(self._uav_x - self._base[0],
                           self._uav_y - self._base[1]) < 10.0
+
+    # ------------------------------------------------------------------
+    #  UX helpers — hints, error messages, reset summary
+    # ------------------------------------------------------------------
+
+    def _build_reset_message(self, task_name: str) -> str:
+        nearest = self._nearest_rp()
+        lines = [
+            f"Episode started. Task={task_name}, "
+            f"{len(self._rps)} RPs to visit, "
+            f"{len(self._obstacles)} obstacles, "
+            f"battery={self._battery_pct():.0%}.",
+            "",
+            "Actions: move_N, move_NE, move_E, move_SE, move_S, move_SW, "
+            "move_W, move_NW, hover_collect, return_base.",
+            "",
+            f"Goal: visit all RPs, collect data, return to base.",
+        ]
+        if nearest:
+            rp_idx, dist = nearest
+            pri = self._nodes[rp_idx]["priority"]
+            lines.append(
+                f"Nearest RP: id={rp_idx} (priority={pri}) at {dist:.0f} m "
+                f"— try moving toward it first."
+            )
+        return " ".join(lines)
+
+    def _handle_unknown_action(self, act: str) -> tuple[float, str]:
+        matches = get_close_matches(act, ALL_ACTIONS, n=2, cutoff=0.4)
+        if matches:
+            suggestion = " or ".join(f"'{m}'" for m in matches)
+            msg = f"Unknown action '{act}'. Did you mean {suggestion}?"
+        else:
+            msg = (
+                f"Unknown action '{act}'. "
+                f"Valid actions: {', '.join(ALL_ACTIONS)}."
+            )
+        return -0.01, msg
+
+    def _build_hint(self) -> str:
+        if self._done:
+            return ""
+        parts = []
+
+        # Battery warning
+        batt = self._battery_pct()
+        if batt < 0.15:
+            parts.append("CRITICAL: battery below 15%! Use return_base now.")
+        elif batt < 0.30:
+            parts.append("Warning: battery below 30%, consider returning soon.")
+
+        # Suggest nearest unvisited RP
+        nearest = self._nearest_rp()
+        if nearest and not parts:
+            rp_idx, dist = nearest
+            pri = self._nodes[rp_idx]["priority"]
+            if dist <= COLLECT_RADIUS:
+                parts.append(
+                    f"RP-{rp_idx} (priority={pri}) is within collect range "
+                    f"— try hover_collect."
+                )
+            else:
+                # Suggest direction
+                node = self._nodes[rp_idx]
+                direction = self._suggest_direction(node["x"], node["y"])
+                parts.append(
+                    f"Nearest unvisited RP-{rp_idx} (priority={pri}) is {dist:.0f} m away "
+                    f"— try {direction}."
+                )
+
+        # All collected
+        if len(self._visited_rps) == len(self._rps) and len(self._rps) > 0:
+            parts.append("All RPs collected! Use return_base to finish.")
+
+        if not parts:
+            return ""
+        return " [Hint: " + " ".join(parts) + "]"
+
+    def _nearest_rp(self) -> Optional[tuple[int, float]]:
+        best_idx, best_dist = None, float("inf")
+        for rp_idx in self._rps:
+            if rp_idx in self._visited_rps:
+                continue
+            node = self._nodes[rp_idx]
+            d = math.hypot(self._uav_x - node["x"], self._uav_y - node["y"])
+            if d < best_dist:
+                best_idx, best_dist = rp_idx, d
+        if best_idx is not None:
+            return best_idx, best_dist
+        return None
+
+    def _suggest_direction(self, target_x: float, target_y: float) -> str:
+        dx = target_x - self._uav_x
+        dy = target_y - self._uav_y
+        angle = math.atan2(-dy, dx)  # negative because y increases downward
+        # Map angle to 8 compass directions
+        dirs = ["move_E", "move_NE", "move_N", "move_NW",
+                "move_W", "move_SW", "move_S", "move_SE"]
+        idx = round(angle / (math.pi / 4)) % 8
+        return dirs[idx]
 
     def _make_observation(self, reward: float, message: str) -> UAVObservation:
         sensors = []
