@@ -69,9 +69,12 @@ def _reset_env(task_name: str, seed: int = 42) -> dict:
     s["battery"] = s["battery_cap"]
     s["base"] = (task["map_w"] / 2, task["map_h"] / 2)
 
-    s["nodes"] = deploy_nodes(task["node_count"], s["map_w"], s["map_h"], seed=seed)
     s["obstacles"] = deploy_obstacles(
         task["obstacle_count"], s["map_w"], s["map_h"], seed=seed,
+    )
+    s["nodes"] = deploy_nodes(
+        task["node_count"], s["map_w"], s["map_h"],
+        seed=seed, obstacles=s["obstacles"],
     )
     s["rps"], s["rp_members"] = select_rendezvous_points(
         s["nodes"], s["obstacles"], task["rp_radius"],
@@ -536,6 +539,9 @@ def _do_auto_play(task_name, seed, _state):
     yield s, _render_svg(s), _render_stats(s), _render_log(s)
     time.sleep(0.3)
 
+    _stuck_count = 0
+    _last_pos = (s["uav_x"], s["uav_y"])
+
     while not s["done"]:
         unvisited = [i for i in s["rps"] if i not in s["visited"]]
         if not unvisited:
@@ -552,13 +558,17 @@ def _do_auto_play(task_name, seed, _state):
         if can_collect:
             s = _step_env(s, "hover_collect")
         else:
-            target = min(
+            # Sort unvisited RPs by distance; skip stuck targets
+            sorted_rps = sorted(
                 unvisited,
                 key=lambda i: math.hypot(
                     s["uav_x"] - s["nodes"][i]["x"],
                     s["uav_y"] - s["nodes"][i]["y"],
                 ),
             )
+            # If stuck on same position for 5+ steps, try next-closest RP
+            rp_idx = min(_stuck_count // 5, len(sorted_rps) - 1)
+            target = sorted_rps[rp_idx]
             n = s["nodes"][target]
             angle_deg = math.degrees(
                 math.atan2(n["y"] - s["uav_y"], n["x"] - s["uav_x"])
@@ -567,11 +577,36 @@ def _do_auto_play(task_name, seed, _state):
                 "E": 0, "SE": 45, "S": 90, "SW": 135,
                 "W": 180, "NW": -135, "N": -90, "NE": -45,
             }
-            best = min(
+            # Rank directions by angle proximity; try alternatives if blocked
+            ranked = sorted(
                 compass,
                 key=lambda d: abs(((compass[d] - angle_deg + 180) % 360) - 180),
             )
-            s = _step_env(s, best)
+            chosen = ranked[0]
+            for d in ranked:
+                dx, dy = MOVE_DIRS[d]
+                nx = s["uav_x"] + dx * STEP_SIZE
+                ny = s["uav_y"] + dy * STEP_SIZE
+                nx = max(0, min(s["map_w"], nx))
+                ny = max(0, min(s["map_h"], ny))
+                if not point_inside_any_obstacle(nx, ny, s["obstacles"]) \
+                   and not blocked((s["uav_x"], s["uav_y"]), (nx, ny), s["obstacles"]):
+                    chosen = d
+                    break
+            s = _step_env(s, chosen)
+
+        cur_pos = (s["uav_x"], s["uav_y"])
+        if cur_pos == _last_pos:
+            _stuck_count += 1
+        else:
+            _stuck_count = 0
+        _last_pos = cur_pos
+
+        # If hopelessly stuck, return to base early
+        if _stuck_count >= 15:
+            s = _step_env(s, "return_base")
+            yield s, _render_svg(s), _render_stats(s), _render_log(s)
+            break
 
         yield s, _render_svg(s), _render_stats(s), _render_log(s)
         time.sleep(0.15)

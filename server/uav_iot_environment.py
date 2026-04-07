@@ -159,13 +159,14 @@ class UAVIoTEnvironment(Environment[UAVAction, UAVObservation, UAVState]):
         # Base station at centre
         self._base = (self._map_w / 2, self._map_h / 2)
 
-        # Deploy sensors and obstacles
+        # Deploy obstacles first, then sensors (avoiding obstacle interiors)
         effective_seed = seed if seed is not None else 42
-        self._nodes = deploy_nodes(
-            task["node_count"], self._map_w, self._map_h, seed=effective_seed,
-        )
         self._obstacles = deploy_obstacles(
             task["obstacle_count"], self._map_w, self._map_h, seed=effective_seed,
+        )
+        self._nodes = deploy_nodes(
+            task["node_count"], self._map_w, self._map_h,
+            seed=effective_seed, obstacles=self._obstacles,
         )
 
         # Select rendezvous points
