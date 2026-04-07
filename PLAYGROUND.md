@@ -4,10 +4,10 @@ Control a UAV to collect data from IoT sensor clusters and return to base.
 
 ## Tabs
 
-- **Simulation** — interactive visual map with drone, sensors, obstacles, and controls
+- **Custom** — interactive visual map with drone, sensors, obstacles, and controls
 - **Playground** — raw JSON interface for API testing and AI agent development
 
-## Simulation Tab
+## Custom Tab
 
 1. Select task difficulty (easy / medium / hard) and click **Reset**
 2. Use the **direction buttons** to fly the UAV toward sensor clusters
