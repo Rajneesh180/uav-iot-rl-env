@@ -47,11 +47,11 @@ def log_step(step: int, action: str, reward: float, done: bool, error) -> None:
     )
 
 
-def log_end(success: bool, steps: int, rewards: List[float]) -> None:
+def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> None:
     rewards_str = ",".join(f"{r:.2f}" for r in rewards)
     print(
         f"[END] success={'true' if success else 'false'} "
-        f"steps={steps} rewards={rewards_str}",
+        f"steps={steps} score={score:.2f} rewards={rewards_str}",
         flush=True,
     )
 
@@ -170,6 +170,7 @@ async def run_task(client: OpenAI, task_id: str) -> None:
     rewards: List[float] = []
     steps_taken = 0
     success = False
+    score = 0.01
 
     log_start(task=task_id, env=BENCHMARK, model=MODEL_NAME)
 
@@ -226,8 +227,13 @@ async def run_task(client: OpenAI, task_id: str) -> None:
             if done:
                 break
 
-        total = sum(rewards)
-        success = total > SUCCESS_SCORE_THRESHOLD
+        # Fetch the environment's composite score
+        try:
+            state = await env.state()
+            score = state.score
+        except Exception:
+            score = 0.01
+        success = score >= SUCCESS_SCORE_THRESHOLD
 
     except Exception as exc:
         print(f"[DEBUG] Episode error: {exc}", flush=True)
@@ -236,7 +242,7 @@ async def run_task(client: OpenAI, task_id: str) -> None:
             await env.close()
         except Exception as e:
             print(f"[DEBUG] env.close() error: {e}", flush=True)
-        log_end(success=success, steps=steps_taken, rewards=rewards)
+        log_end(success=success, steps=steps_taken, score=score, rewards=rewards)
 
 
 # ---------------------------------------------------------------------------
