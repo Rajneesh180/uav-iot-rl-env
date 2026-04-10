@@ -10,10 +10,17 @@ from typing import Any, Optional
 from openenv.core.env_server.interfaces import Environment
 
 try:
-    from ..models import UAVAction, UAVObservation, UAVState
+    from ..models import (
+        ObstacleInfo, SensorInfo, UAVAction, UAVObservation, UAVState,
+    )
     from .simulation import (
-        COLLECT_RADIUS, CRUISE_SPEED, E_FLY_PER_M, HOVER_TIME, P_HOVER,
-        STEP_SIZE, TASKS, Coord, Node, Obstacle,
+        BASE_PROXIMITY, COLLECT_RADIUS, CRUISE_SPEED, E_FLY_PER_M,
+        HOVER_TIME, OBSTACLE_ATTEMPT_FRAC, P_HOVER, R_COLLECT_PER_PRI,
+        R_CRASH, R_HOVER_MISS, R_OBSTACLE_HIT, R_PATH_BLOCKED,
+        R_RETURN_BASE, R_RETURN_COVERAGE, R_STRANDED, R_TIME_PENALTY,
+        R_UNKNOWN_ACTION, STEP_SIZE, TASKS, WIND_PERSISTENCE,
+        W_COVERAGE, W_ENERGY, W_PRIORITY, W_SAFE_RETURN,
+        Coord, Node, Obstacle,
     )
     from .simulation.deployment import deploy_nodes, deploy_obstacles
     from .simulation.energy import energy_for_distance, energy_for_hover
@@ -21,11 +28,19 @@ try:
         blocked, point_inside_any_obstacle, shortest_obstacle_free_path,
     )
     from .simulation.rp_selection import select_rendezvous_points
+    from .simulation.wind import WindModel
 except ImportError:
-    from models import UAVAction, UAVObservation, UAVState
+    from models import (
+        ObstacleInfo, SensorInfo, UAVAction, UAVObservation, UAVState,
+    )
     from server.simulation import (
-        COLLECT_RADIUS, CRUISE_SPEED, E_FLY_PER_M, HOVER_TIME, P_HOVER,
-        STEP_SIZE, TASKS, Coord, Node, Obstacle,
+        BASE_PROXIMITY, COLLECT_RADIUS, CRUISE_SPEED, E_FLY_PER_M,
+        HOVER_TIME, OBSTACLE_ATTEMPT_FRAC, P_HOVER, R_COLLECT_PER_PRI,
+        R_CRASH, R_HOVER_MISS, R_OBSTACLE_HIT, R_PATH_BLOCKED,
+        R_RETURN_BASE, R_RETURN_COVERAGE, R_STRANDED, R_TIME_PENALTY,
+        R_UNKNOWN_ACTION, STEP_SIZE, TASKS, WIND_PERSISTENCE,
+        W_COVERAGE, W_ENERGY, W_PRIORITY, W_SAFE_RETURN,
+        Coord, Node, Obstacle,
     )
     from server.simulation.deployment import deploy_nodes, deploy_obstacles
     from server.simulation.energy import energy_for_distance, energy_for_hover
@@ -33,6 +48,7 @@ except ImportError:
         blocked, point_inside_any_obstacle, shortest_obstacle_free_path,
     )
     from server.simulation.rp_selection import select_rendezvous_points
+    from server.simulation.wind import WindModel
 
 # 8-direction movement deltas (unit vectors scaled by STEP_SIZE)
 _SQRT2_2 = math.sqrt(2) / 2
@@ -56,7 +72,7 @@ Control a UAV to collect data from IoT sensor clusters and return to base.
 
 ## How to Play
 
-1. **Reset** the environment (picks task: easy / medium / hard)
+1. **Reset** the environment (picks task: easy / medium / hard / expert)
 2. **Move** toward sensor clusters using directional actions
 3. **Hover** near a cluster to collect its data
 4. **Return to base** before your battery runs out
@@ -69,6 +85,12 @@ Control a UAV to collect data from IoT sensor clusters and return to base.
 | `hover_collect` | Hover for 10 s, collects data from RPs within 60 m (costs 1685 J) |
 | `return_base` | Autopilot back to base (path avoids obstacles) |
 
+## Wind
+
+Medium, hard, and expert tasks have stochastic wind that drifts the UAV off \
+course each step. Wind intensity increases with difficulty. Check `wind_x` \
+and `wind_y` in the observation to anticipate drift and adjust your heading.
+
 ## Tips
 
 - Check `sensors` in the observation for RP locations and distances
@@ -77,6 +99,7 @@ Control a UAV to collect data from IoT sensor clusters and return to base.
 - Use `return_base` when you've collected enough or battery is low
 - `hover_collect` only works within 60 m of an unvisited RP
 - Obstacles block movement; the UAV cannot fly through them
+- On windy tasks, compensate for drift when navigating tight corridors
 
 ## Scoring
 
@@ -84,11 +107,13 @@ Control a UAV to collect data from IoT sensor clusters and return to base.
 score = 0.35 × coverage + 0.25 × priority_ratio
       + 0.25 × energy_efficiency + 0.15 × safe_return
 ```
+
+Energy efficiency = coverage / energy_fraction_used (rewarding more collection \
+per unit energy spent, not idle conservation).
 """
 
 
 class UAVIoTEnvironment(Environment[UAVAction, UAVObservation, UAVState]):
-    """UAV IoT data-collection environment with 3 difficulty levels."""
 
     SUPPORTS_CONCURRENT_SESSIONS = True
 
@@ -115,10 +140,13 @@ class UAVIoTEnvironment(Environment[UAVAction, UAVObservation, UAVState]):
         # UAV
         self._uav_x: float = 0.0
         self._uav_y: float = 0.0
-        self._battery: float = 0.0       # Joules remaining
-        self._battery_cap: float = 0.0    # Joules total
+        self._battery: float = 0.0
+        self._battery_cap: float = 0.0
         self._visited_rps: set[int] = set()
         self._total_reward: float = 0.0
+
+        # Wind
+        self._wind: WindModel = WindModel(0.0, 0.0)
 
     # ------------------------------------------------------------------
     #  OpenEnv interface
@@ -174,6 +202,14 @@ class UAVIoTEnvironment(Environment[UAVAction, UAVObservation, UAVState]):
             self._nodes, self._obstacles, task["rp_radius"],
         )
 
+        # Wind model — seeded independently from deployment
+        self._wind = WindModel(
+            base_speed=task.get("wind_speed", 0.0),
+            variability=task.get("wind_variability", 0.0),
+            persistence=WIND_PERSISTENCE,
+            seed=effective_seed * 31 + 17,
+        )
+
         # UAV starts at base
         self._uav_x, self._uav_y = self._base
         self._visited_rps = set()
@@ -210,13 +246,11 @@ class UAVIoTEnvironment(Environment[UAVAction, UAVObservation, UAVState]):
         else:
             reward, msg = self._handle_unknown_action(act)
 
-        # Small time penalty to encourage efficiency
-        reward -= 0.005
+        reward += R_TIME_PENALTY
 
-        # Check termination conditions
         if self._battery <= 0:
             self._done = True
-            reward -= 1.0
+            reward += R_CRASH
             msg += " Battery depleted! UAV crashed."
         elif self._step_count >= self._max_steps:
             self._done = True
@@ -237,6 +271,7 @@ class UAVIoTEnvironment(Environment[UAVAction, UAVObservation, UAVState]):
             battery_pct=self._battery_pct(),
             data_collected=self._data_collected(),
             data_possible=self._data_possible(),
+            wind_speed=round(self._wind.speed, 2),
             score=self._compute_score(),
         )
 
@@ -253,21 +288,31 @@ class UAVIoTEnvironment(Environment[UAVAction, UAVObservation, UAVState]):
         new_x = max(0.0, min(float(self._map_w), new_x))
         new_y = max(0.0, min(float(self._map_h), new_y))
 
-        # Check obstacle collision
         if point_inside_any_obstacle(new_x, new_y, self._obstacles):
-            self._battery -= energy_for_distance(STEP_SIZE * 0.1)  # small penalty for attempt
-            return -0.05, f"Blocked! Position ({new_x:.0f},{new_y:.0f}) is inside an obstacle."
+            self._battery -= energy_for_distance(STEP_SIZE * OBSTACLE_ATTEMPT_FRAC)
+            return R_OBSTACLE_HIT, f"Blocked! Position ({new_x:.0f},{new_y:.0f}) is inside an obstacle."
 
-        # Check if path crosses obstacle
         if blocked((self._uav_x, self._uav_y), (new_x, new_y), self._obstacles):
-            self._battery -= energy_for_distance(STEP_SIZE * 0.1)
-            return -0.03, f"Path to ({new_x:.0f},{new_y:.0f}) blocked by an obstacle."
+            self._battery -= energy_for_distance(STEP_SIZE * OBSTACLE_ATTEMPT_FRAC)
+            return R_PATH_BLOCKED, f"Path to ({new_x:.0f},{new_y:.0f}) blocked by an obstacle."
 
         dist = math.hypot(new_x - self._uav_x, new_y - self._uav_y)
         self._battery -= energy_for_distance(dist)
-        self._uav_x = new_x
-        self._uav_y = new_y
-        return 0.0, f"Moved {direction.replace('move_', '')} to ({new_x:.0f},{new_y:.0f}). Battery: {self._battery_pct():.0%}."
+
+        # Apply wind drift: wind_vector * (time for this move)
+        wx, wy = self._wind.step()
+        drift_time = STEP_SIZE / CRUISE_SPEED
+        final_x = max(0.0, min(float(self._map_w), new_x + wx * drift_time))
+        final_y = max(0.0, min(float(self._map_h), new_y + wy * drift_time))
+
+        # If wind pushes into obstacle, land at intended position instead
+        if point_inside_any_obstacle(final_x, final_y, self._obstacles):
+            final_x, final_y = new_x, new_y
+
+        self._uav_x = final_x
+        self._uav_y = final_y
+        wind_note = f" (wind drift {self._wind.speed:.1f} m/s)" if self._wind.speed > 0.5 else ""
+        return 0.0, f"Moved {direction.replace('move_', '')} to ({final_x:.0f},{final_y:.0f}){wind_note}. Battery: {self._battery_pct():.0%}."
 
     def _do_hover_collect(self) -> tuple[float, str]:
         self._battery -= energy_for_hover()
@@ -284,7 +329,7 @@ class UAVIoTEnvironment(Environment[UAVAction, UAVObservation, UAVState]):
 
         if collected_ids:
             priorities = [self._nodes[i]["priority"] for i in collected_ids]
-            reward = sum(p / 10.0 for p in priorities) * 0.3
+            reward = sum(p * R_COLLECT_PER_PRI for p in priorities)
             names = ", ".join(f"RP-{i}(pri={self._nodes[i]['priority']})" for i in collected_ids)
             remaining = len(self._rps) - len(self._visited_rps)
             return reward, (
@@ -297,11 +342,11 @@ class UAVIoTEnvironment(Environment[UAVAction, UAVObservation, UAVState]):
         nearest = self._nearest_rp()
         if nearest:
             rp_idx, dist = nearest
-            return -0.01, (
+            return R_HOVER_MISS, (
                 f"No RPs within {COLLECT_RADIUS:.0f} m range. "
                 f"Nearest unvisited: RP-{rp_idx} at {dist:.0f} m."
             )
-        return -0.01, "No uncollected RPs within range."
+        return R_HOVER_MISS, "No uncollected RPs within range."
 
     def _do_return_base(self) -> tuple[float, str]:
         """Fly back to base using obstacle-aware path."""
@@ -311,21 +356,19 @@ class UAVIoTEnvironment(Environment[UAVAction, UAVObservation, UAVState]):
         energy = energy_for_distance(dist)
 
         if energy > self._battery:
-            # Not enough battery to return — still try but will crash
             fraction = self._battery / energy if energy > 0 else 0
             partial_idx = max(0, int(len(path) * fraction) - 1)
             if partial_idx > 0 and partial_idx < len(path):
                 self._uav_x, self._uav_y = path[partial_idx]
             self._battery = 0.0
-            return -0.5, "Insufficient battery to reach base. UAV stranded."
+            return R_STRANDED, "Insufficient battery to reach base. UAV stranded."
 
         self._battery -= energy
         self._uav_x, self._uav_y = self._base
         self._done = True
 
-        # Reward for safe return scales with data collected
         coverage = len(self._visited_rps) / max(1, len(self._rps))
-        reward = 0.5 * coverage + 0.2  # base reward for returning safely
+        reward = R_RETURN_COVERAGE * coverage + R_RETURN_BASE
         return reward, (
             f"Returned to base. Collected {len(self._visited_rps)}/{len(self._rps)} RPs. "
             f"Battery remaining: {self._battery_pct():.0%}."
@@ -347,28 +390,38 @@ class UAVIoTEnvironment(Environment[UAVAction, UAVObservation, UAVState]):
         return sum(self._nodes[i]["priority"] for i in self._rps)
 
     def _compute_score(self) -> float:
-        """Compute final score in the open interval (0, 1) for grading."""
+        """Composite score in the open interval (0, 1) for grading."""
         if not self._rps:
             return 0.01
 
         coverage = len(self._visited_rps) / len(self._rps)
         dp = self._data_possible()
         priority_score = self._data_collected() / dp if dp > 0 else 0.0
-        energy_eff = self._battery_pct()  # higher remaining = more efficient
-        safe_return = 1.0 if self._at_base() and self._battery > 0 else 0.0
+
+        # Energy efficiency: coverage per unit energy spent (not idle conservation)
+        energy_used_frac = 1.0 - self._battery_pct()
+        if energy_used_frac < 0.01:
+            energy_eff = 0.0
+        else:
+            energy_eff = min(1.0, coverage / energy_used_frac)
+
+        # Safe return only counts if the UAV actually traveled
+        safe_return = (
+            1.0 if self._step_count > 0 and self._at_base() and self._battery > 0
+            else 0.0
+        )
 
         raw = (
-            0.35 * coverage
-            + 0.25 * priority_score
-            + 0.25 * energy_eff
-            + 0.15 * safe_return
+            W_COVERAGE * coverage
+            + W_PRIORITY * priority_score
+            + W_ENERGY * energy_eff
+            + W_SAFE_RETURN * safe_return
         )
-        # Clamp to open interval (0, 1) — hackathon requires strict bounds
         return max(0.01, min(0.99, raw))
 
     def _at_base(self) -> bool:
         return math.hypot(self._uav_x - self._base[0],
-                          self._uav_y - self._base[1]) < 10.0
+                          self._uav_y - self._base[1]) < BASE_PROXIMITY
 
     # ------------------------------------------------------------------
     #  UX helpers — hints, error messages, reset summary
@@ -376,11 +429,15 @@ class UAVIoTEnvironment(Environment[UAVAction, UAVObservation, UAVState]):
 
     def _build_reset_message(self, task_name: str) -> str:
         nearest = self._nearest_rp()
+        task = TASKS[task_name]
+        wind_info = ""
+        if task.get("wind_speed", 0) > 0:
+            wind_info = f" Wind: ~{task['wind_speed']:.1f} m/s (variable)."
         lines = [
             f"Episode started. Task={task_name}, "
             f"{len(self._rps)} RPs to visit, "
             f"{len(self._obstacles)} obstacles, "
-            f"battery={self._battery_pct():.0%}.",
+            f"battery={self._battery_pct():.0%}.{wind_info}",
             "",
             "Actions: move_N, move_NE, move_E, move_SE, move_S, move_SW, "
             "move_W, move_NW, hover_collect, return_base.",
@@ -406,7 +463,7 @@ class UAVIoTEnvironment(Environment[UAVAction, UAVObservation, UAVState]):
                 f"Unknown action '{act}'. "
                 f"Valid actions: {', '.join(ALL_ACTIONS)}."
             )
-        return -0.01, msg
+        return R_UNKNOWN_ACTION, msg
 
     def _build_hint(self) -> str:
         if self._done:
@@ -475,20 +532,21 @@ class UAVIoTEnvironment(Environment[UAVAction, UAVObservation, UAVState]):
         for rp_idx in self._rps:
             node = self._nodes[rp_idx]
             dist = math.hypot(self._uav_x - node["x"], self._uav_y - node["y"])
-            sensors.append({
-                "id": rp_idx,
-                "x": node["x"],
-                "y": node["y"],
-                "priority": node["priority"],
-                "distance": round(dist, 1),
-                "visited": rp_idx in self._visited_rps,
-            })
+            sensors.append(SensorInfo(
+                id=rp_idx,
+                x=node["x"],
+                y=node["y"],
+                priority=node["priority"],
+                distance=round(dist, 1),
+                visited=rp_idx in self._visited_rps,
+            ))
 
         obstacles = [
-            {"id": o["id"], "x1": o["x1"], "y1": o["y1"], "x2": o["x2"], "y2": o["y2"]}
+            ObstacleInfo(id=o["id"], x1=o["x1"], y1=o["y1"], x2=o["x2"], y2=o["y2"])
             for o in self._obstacles
         ]
 
+        wx, wy = self._wind.vector
         return UAVObservation(
             done=self._done,
             reward=reward,
@@ -508,6 +566,8 @@ class UAVIoTEnvironment(Environment[UAVAction, UAVObservation, UAVState]):
             ),
             map_width=float(self._map_w),
             map_height=float(self._map_h),
+            wind_x=round(wx, 2),
+            wind_y=round(wy, 2),
             message=message,
             step_num=self._step_count,
             task_name=self._task_name,

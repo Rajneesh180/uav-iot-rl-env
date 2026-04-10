@@ -25,7 +25,7 @@ HF_TOKEN = os.getenv("HF_TOKEN")
 LOCAL_IMAGE_NAME = os.getenv("LOCAL_IMAGE_NAME")
 
 BENCHMARK = "uav_iot_env"
-TASK_STEPS = {"easy": 80, "medium": 120, "hard": 160}
+TASK_STEPS = {"easy": 80, "medium": 120, "hard": 160, "expert": 200}
 TASKS = list(TASK_STEPS.keys())
 SUCCESS_SCORE_THRESHOLD = 0.5
 
@@ -76,6 +76,7 @@ Navigate a 2D area with obstacles to visit Rendezvous Points (RPs) where IoT sen
 4. When close to an RP (within 60m), use hover_collect
 5. When battery < 30% or all RPs visited, use return_base
 6. Prefer visiting nearby unvisited RPs to minimize travel
+7. On windy tasks, check wind_x/wind_y and compensate — the wind drifts your position each step
 
 ## Response Format
 Respond with ONLY a JSON object: {"action": "ACTION_NAME", "reasoning": "brief explanation"}
@@ -97,9 +98,15 @@ def format_observation(obs: dict) -> str:
         f"Dist to base: {obs.get('dist_to_base', 0):.0f}m",
         f"Map: {obs.get('map_width', 0):.0f}x{obs.get('map_height', 0):.0f}m",
         f"Energy cost: {obs.get('energy_per_move', 850):.0f} J per 50m move",
-        "",
-        "Unvisited RPs:",
     ]
+
+    wx, wy = obs.get("wind_x", 0), obs.get("wind_y", 0)
+    if abs(wx) > 0.1 or abs(wy) > 0.1:
+        speed = (wx**2 + wy**2) ** 0.5
+        lines.append(f"Wind: ({wx:+.1f}, {wy:+.1f}) m/s — {speed:.1f} m/s total")
+
+    lines.append("")
+    lines.append("Unvisited RPs:")
     sensors = obs.get("sensors", [])
     unvisited = sorted(
         [s for s in sensors if not s.get("visited")],

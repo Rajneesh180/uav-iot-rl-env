@@ -14,7 +14,12 @@ import gradio as gr
 
 try:
     from .simulation import (
-        COLLECT_RADIUS, STEP_SIZE, TASKS, Coord, Node, Obstacle,
+        BASE_PROXIMITY, COLLECT_RADIUS, CRUISE_SPEED,
+        OBSTACLE_ATTEMPT_FRAC, R_COLLECT_PER_PRI, R_CRASH, R_HOVER_MISS,
+        R_OBSTACLE_HIT, R_PATH_BLOCKED, R_RETURN_BASE, R_RETURN_COVERAGE,
+        R_STRANDED, R_TIME_PENALTY, STEP_SIZE, TASKS, WIND_PERSISTENCE,
+        W_COVERAGE, W_ENERGY, W_PRIORITY, W_SAFE_RETURN,
+        Coord, Node, Obstacle,
     )
     from .simulation.deployment import deploy_nodes, deploy_obstacles
     from .simulation.energy import energy_for_distance, energy_for_hover
@@ -22,9 +27,15 @@ try:
         blocked, point_inside_any_obstacle, shortest_obstacle_free_path,
     )
     from .simulation.rp_selection import select_rendezvous_points
+    from .simulation.wind import WindModel
 except ImportError:
     from server.simulation import (
-        COLLECT_RADIUS, STEP_SIZE, TASKS, Coord, Node, Obstacle,
+        BASE_PROXIMITY, COLLECT_RADIUS, CRUISE_SPEED,
+        OBSTACLE_ATTEMPT_FRAC, R_COLLECT_PER_PRI, R_CRASH, R_HOVER_MISS,
+        R_OBSTACLE_HIT, R_PATH_BLOCKED, R_RETURN_BASE, R_RETURN_COVERAGE,
+        R_STRANDED, R_TIME_PENALTY, STEP_SIZE, TASKS, WIND_PERSISTENCE,
+        W_COVERAGE, W_ENERGY, W_PRIORITY, W_SAFE_RETURN,
+        Coord, Node, Obstacle,
     )
     from server.simulation.deployment import deploy_nodes, deploy_obstacles
     from server.simulation.energy import energy_for_distance, energy_for_hover
@@ -32,6 +43,7 @@ except ImportError:
         blocked, point_inside_any_obstacle, shortest_obstacle_free_path,
     )
     from server.simulation.rp_selection import select_rendezvous_points
+    from server.simulation.wind import WindModel
 
 
 # ─── Movement directions ─────────────────────────────────────────
@@ -56,6 +68,7 @@ def _new_state() -> dict:
         "visited": set(), "trail": [],
         "step": 0, "max_steps": 0, "done": True,
         "total_reward": 0, "log": [],
+        "wind": WindModel(0.0, 0.0),
     }
 
 
@@ -80,6 +93,13 @@ def _reset_env(task_name: str, seed: int = 42) -> dict:
         s["nodes"], s["obstacles"], task["rp_radius"],
     )
 
+    s["wind"] = WindModel(
+        base_speed=task.get("wind_speed", 0.0),
+        variability=task.get("wind_variability", 0.0),
+        persistence=WIND_PERSISTENCE,
+        seed=seed * 31 + 17,
+    )
+
     s["uav_x"], s["uav_y"] = s["base"]
     s["visited"] = set()
     s["trail"] = [s["base"]]
@@ -98,7 +118,7 @@ def _bat_pct(s: dict) -> float:
 
 
 def _at_base(s: dict) -> bool:
-    return math.hypot(s["uav_x"] - s["base"][0], s["uav_y"] - s["base"][1]) < 10
+    return math.hypot(s["uav_x"] - s["base"][0], s["uav_y"] - s["base"][1]) < BASE_PROXIMITY
 
 
 def _data_collected(s: dict) -> float:
@@ -115,9 +135,10 @@ def _compute_score(s: dict) -> float:
     coverage = len(s["visited"]) / len(s["rps"])
     dp = _data_possible(s)
     pri = _data_collected(s) / dp if dp > 0 else 0
-    eff = _bat_pct(s)
-    safe = 1.0 if _at_base(s) and s["battery"] > 0 else 0.0
-    return 0.35 * coverage + 0.25 * pri + 0.25 * eff + 0.15 * safe
+    energy_used_frac = 1.0 - _bat_pct(s)
+    eff = min(1.0, coverage / energy_used_frac) if energy_used_frac >= 0.01 else 0.0
+    safe = 1.0 if s["step"] > 0 and _at_base(s) and s["battery"] > 0 else 0.0
+    return W_COVERAGE * coverage + W_PRIORITY * pri + W_ENERGY * eff + W_SAFE_RETURN * safe
 
 
 def _step_env(s: dict, action: str) -> dict:
@@ -137,17 +158,25 @@ def _step_env(s: dict, action: str) -> dict:
         ny = max(0, min(s["map_h"], ny))
 
         if point_inside_any_obstacle(nx, ny, s["obstacles"]):
-            s["battery"] -= energy_for_distance(STEP_SIZE * 0.1)
-            reward, msg = -0.05, f"\U0001f6ab Blocked! ({nx:.0f},{ny:.0f}) inside obstacle."
+            s["battery"] -= energy_for_distance(STEP_SIZE * OBSTACLE_ATTEMPT_FRAC)
+            reward, msg = R_OBSTACLE_HIT, f"\U0001f6ab Blocked! ({nx:.0f},{ny:.0f}) inside obstacle."
         elif blocked((s["uav_x"], s["uav_y"]), (nx, ny), s["obstacles"]):
-            s["battery"] -= energy_for_distance(STEP_SIZE * 0.1)
-            reward, msg = -0.03, "\U0001f6ab Path blocked by obstacle."
+            s["battery"] -= energy_for_distance(STEP_SIZE * OBSTACLE_ATTEMPT_FRAC)
+            reward, msg = R_PATH_BLOCKED, "\U0001f6ab Path blocked by obstacle."
         else:
             dist = math.hypot(nx - s["uav_x"], ny - s["uav_y"])
             s["battery"] -= energy_for_distance(dist)
-            s["uav_x"], s["uav_y"] = nx, ny
-            s["trail"].append((nx, ny))
-            reward, msg = 0.0, f"\u27a1\ufe0f  Moved {action} \u2192 ({nx:.0f},{ny:.0f})"
+            # Wind drift
+            wx, wy = s["wind"].step()
+            drift_time = STEP_SIZE / CRUISE_SPEED
+            fx = max(0, min(s["map_w"], nx + wx * drift_time))
+            fy = max(0, min(s["map_h"], ny + wy * drift_time))
+            if point_inside_any_obstacle(fx, fy, s["obstacles"]):
+                fx, fy = nx, ny
+            s["uav_x"], s["uav_y"] = fx, fy
+            s["trail"].append((fx, fy))
+            wind_note = f" \U0001f4a8{s['wind'].speed:.1f}m/s" if s["wind"].speed > 0.5 else ""
+            reward, msg = 0.0, f"\u27a1\ufe0f  Moved {action} \u2192 ({fx:.0f},{fy:.0f}){wind_note}"
 
     elif action == "hover_collect":
         s["battery"] -= energy_for_hover()
@@ -160,13 +189,13 @@ def _step_env(s: dict, action: str) -> dict:
                 s["visited"].add(rp)
                 collected.append(rp)
         if collected:
-            reward = sum(s["nodes"][i]["priority"] / 10.0 for i in collected) * 0.3
+            reward = sum(s["nodes"][i]["priority"] * R_COLLECT_PER_PRI for i in collected)
             names = ", ".join(
                 f"RP-{i}(p={s['nodes'][i]['priority']})" for i in collected
             )
             msg = f"\U0001f4e1 Collected: {names}"
         else:
-            reward, msg = -0.01, "\U0001f4e1 No RPs in range."
+            reward, msg = R_HOVER_MISS, "\U0001f4e1 No RPs in range."
 
     elif action == "return_base":
         path, dist = shortest_obstacle_free_path(
@@ -175,23 +204,23 @@ def _step_env(s: dict, action: str) -> dict:
         energy = energy_for_distance(dist)
         if energy > s["battery"]:
             s["battery"] = 0
-            reward, msg = -0.5, "\U0001f50b Not enough battery to reach base!"
+            reward, msg = R_STRANDED, "\U0001f50b Not enough battery to reach base!"
         else:
             s["battery"] -= energy
             s["uav_x"], s["uav_y"] = s["base"]
             s["trail"].extend(path[1:])
             s["done"] = True
             cov = len(s["visited"]) / max(1, len(s["rps"]))
-            reward = 0.5 * cov + 0.2
+            reward = R_RETURN_COVERAGE * cov + R_RETURN_BASE
             msg = (
                 f"\U0001f3e0 Returned to base! "
                 f"{len(s['visited'])}/{len(s['rps'])} RPs collected."
             )
 
-    reward -= 0.005
+    reward += R_TIME_PENALTY
     if s["battery"] <= 0:
         s["done"] = True
-        reward -= 1.0
+        reward += R_CRASH
         msg += " \U0001f480 Battery depleted!"
     elif s["step"] >= s["max_steps"]:
         s["done"] = True
@@ -498,6 +527,7 @@ def _render_stats(s: dict) -> str:
           <b>Map:</b> {s['map_w']}\u00d7{s['map_h']}m &nbsp;|&nbsp;
           <b>Obstacles:</b> {len(s['obstacles'])} &nbsp;|&nbsp;
           <b>Sensors:</b> {len(s['nodes'])} &nbsp;|&nbsp;
+          <b>Wind:</b> {s['wind'].speed:.1f} m/s &nbsp;|&nbsp;
           <b>Reward:</b> {s['total_reward']:+.3f}
         </div>
       </div>
@@ -672,7 +702,7 @@ def build_uav_gradio_app(
                 )
                 with gr.Row():
                     task_dd = gr.Dropdown(
-                        choices=["easy", "medium", "hard"],
+                        choices=["easy", "medium", "hard", "expert"],
                         value="medium", label="Task", scale=2,
                     )
                     seed_num = gr.Number(

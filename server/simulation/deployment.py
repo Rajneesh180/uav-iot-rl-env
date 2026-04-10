@@ -45,7 +45,6 @@ def deploy_nodes(
             "id": i,
             "x": x, "y": y,
             "priority": rng.randint(1, 10),
-            "data_level": round(rng.uniform(0.1, 1.0), 2),
         })
     return nodes
 
